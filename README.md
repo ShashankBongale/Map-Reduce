@@ -9,12 +9,12 @@ This repository has Go implementation of Map-Reduce research paper published by 
 * Any number of workers can be launched and coordinator distributes the map and reduce tasks between these worker process.  
 
 ## Usage 
-### Command to build user defined map reduce function
-go build -buildmode=plugin ../mrapps/wc.go  
+* Command to build user defined map reduce function:  
+    go build -buildmode=plugin ../mrapps/wc.go  
 
-### Command to run coordinator process
-go run mrcoordinator.go pg-*.txt  
+* Command to run coordinator process  
+    go run mrcoordinator.go pg-*.txt  
 
-### Command to run worker process
-go run mrworker.go wc.so  
+* Command to run worker process  
+    go run mrworker.go wc.so  
 
