@@ -9,6 +9,9 @@ This repository has Go implementation of Map-Reduce research paper published by 
 * Coordinator schedules map and reduce tasks.  
 * Any number of workers can be launched and coordinator distributes the map and reduce tasks between these worker process.  
 
+## Map-Reduce Architecture  
+![Screenshot](mrarch.png)  
+
 ## Usage 
 * Command to build user defined map reduce function:  
     go build -buildmode=plugin ../mrapps/wc.go  
