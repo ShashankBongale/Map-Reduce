@@ -30,7 +30,7 @@ type Task struct {
 	FileName      string
 	TaskType      TaskType
 	ReducersCount int
-	Partitions    []int
+	Partitions    []string
 }
 
 // Add your RPC definitions here.

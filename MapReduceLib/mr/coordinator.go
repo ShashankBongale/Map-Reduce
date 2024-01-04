@@ -7,8 +7,9 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
-	"strconv"
+	"strings"
 	"sync"
+	"time"
 )
 
 type TaskStatus int
@@ -19,21 +20,31 @@ const (
 	Completed
 )
 
-type TaskInfo struct {
-	status         TaskStatus
-	assignedWorker string
+type MapTaskInfo struct {
+	status           TaskStatus
+	assignedWorker   string
+	taskAssignedTime time.Time
+}
+
+type ReduceTaskInfo struct {
+	status            TaskStatus
+	assignedWorker    string
+	partitionFileList []string
+	taskAssignedTime  time.Time
 }
 
 type Coordinator struct {
 	partitionsCount  int
-	mapTaskStatus    map[string]TaskInfo
-	reduceTaskStatus map[string]TaskInfo
+	mapTaskStatus    map[string]MapTaskInfo
+	reduceTaskStatus map[string]ReduceTaskInfo
 }
 
 var mapTaskLock sync.Mutex
 var reduceTaskLock sync.Mutex
 
 func (c *Coordinator) GetTask(taskRequest *GetTaskRequest, task *Task) error {
+
+	//time.Sleep(10 * time.Second)
 
 	if c.Done() {
 
@@ -53,7 +64,7 @@ func (c *Coordinator) GetTask(taskRequest *GetTaskRequest, task *Task) error {
 			task.TaskType = MapTask
 			task.ReducersCount = c.partitionsCount
 
-			c.mapTaskStatus[taskFile] = TaskInfo{assignedWorker: taskRequest.Processid, status: InProcess}
+			c.mapTaskStatus[taskFile] = MapTaskInfo{assignedWorker: taskRequest.Processid, status: InProcess, taskAssignedTime: time.Now()}
 
 			fmt.Println("Assigning map task for file", taskFile, "for worker with process id", taskRequest.Processid)
 
@@ -85,7 +96,9 @@ func (c *Coordinator) GetTask(taskRequest *GetTaskRequest, task *Task) error {
 			task.FileName = partitionNumber //reduce will process all the files with this partition number
 			task.TaskType = ReduceTask
 
-			c.reduceTaskStatus[partitionNumber] = TaskInfo{assignedWorker: taskRequest.Processid, status: InProcess}
+			task.Partitions = taskInfo.partitionFileList
+
+			c.reduceTaskStatus[partitionNumber] = ReduceTaskInfo{assignedWorker: taskRequest.Processid, status: InProcess, partitionFileList: taskInfo.partitionFileList, taskAssignedTime: time.Now()}
 
 			fmt.Println("Assigning reduce task for partition", partitionNumber, "for worker with process id", taskRequest.Processid)
 
@@ -107,7 +120,16 @@ func (c *Coordinator) TaskCompleted(completedTask *Task, response *string) error
 
 		mapTaskLock.Lock()
 
-		c.mapTaskStatus[completedTask.FileName] = TaskInfo{status: Completed, assignedWorker: ""}
+		if c.mapTaskStatus[completedTask.FileName].status == Completed {
+
+			fmt.Println("Received complete message for already completed map task for file", completedTask.FileName, ".Ignoring the message")
+
+			mapTaskLock.Unlock()
+
+			return nil
+		}
+
+		c.mapTaskStatus[completedTask.FileName] = MapTaskInfo{status: Completed, assignedWorker: ""}
 
 		mapTaskLock.Unlock()
 
@@ -115,19 +137,45 @@ func (c *Coordinator) TaskCompleted(completedTask *Task, response *string) error
 
 		partitionList := completedTask.Partitions
 
-		reduceTaskLock.Lock()
+		for _, partitionFileName := range partitionList {
 
-		for _, partition := range partitionList {
-			c.reduceTaskStatus[strconv.Itoa(partition)] = TaskInfo{status: NotProcessed, assignedWorker: ""}
+			partitionStartIndex := strings.Index(partitionFileName, ".")
+			partitionEndIndex := strings.Index(partitionFileName, ".mapoutput")
+
+			partitionNumber := partitionFileName[partitionStartIndex+1 : partitionEndIndex]
+
+			reduceTaskLock.Lock()
+
+			if reduceTaskInfo, exists := c.reduceTaskStatus[partitionNumber]; exists == true {
+
+				exists := false
+				for _, currPartitionFile := range reduceTaskInfo.partitionFileList {
+
+					if currPartitionFile == partitionFileName {
+						exists = true
+						break
+					}
+				}
+
+				if exists == false {
+					updatedPartitons := append(reduceTaskInfo.partitionFileList, partitionFileName)
+					c.reduceTaskStatus[partitionNumber] = ReduceTaskInfo{status: NotProcessed, assignedWorker: "", partitionFileList: updatedPartitons}
+				}
+			} else {
+
+				partitionList := []string{partitionFileName}
+				c.reduceTaskStatus[partitionNumber] = ReduceTaskInfo{status: NotProcessed, assignedWorker: "", partitionFileList: partitionList}
+
+			}
+
+			reduceTaskLock.Unlock()
 		}
-
-		reduceTaskLock.Unlock()
 
 	} else {
 
 		reduceTaskLock.Lock()
 
-		c.reduceTaskStatus[completedTask.FileName] = TaskInfo{status: Completed, assignedWorker: ""}
+		c.reduceTaskStatus[completedTask.FileName] = ReduceTaskInfo{status: Completed, assignedWorker: "", partitionFileList: []string{}}
 
 		reduceTaskLock.Unlock()
 
@@ -162,6 +210,69 @@ func (c *Coordinator) Done() bool {
 	return true
 }
 
+func (c *Coordinator) TaskCompletionChecker() {
+
+	pendingTaskExist := true
+
+	for pendingTaskExist == true {
+
+		pendingTaskExist = false
+
+		mapTaskLock.Lock()
+
+		for taskFileName, mapTaskInfo := range c.mapTaskStatus {
+
+			if mapTaskInfo.status == InProcess {
+
+				pendingTaskExist = true
+				timeNow := time.Now()
+				timeElapsedInSecs := timeNow.Sub(mapTaskInfo.taskAssignedTime)
+
+				if timeElapsedInSecs.Seconds() > float64(10) {
+
+					fmt.Println("Map task for file", taskFileName, "is not completed in threshold time, reassigning it")
+					c.mapTaskStatus[taskFileName] = MapTaskInfo{status: NotProcessed, assignedWorker: "", taskAssignedTime: time.Time{}}
+
+				}
+			} else if mapTaskInfo.status == NotProcessed {
+				pendingTaskExist = true
+			}
+		}
+
+		mapTaskLock.Unlock()
+
+		reduceTaskLock.Lock()
+
+		for taskFileName, reduceTaskInfo := range c.reduceTaskStatus {
+
+			if reduceTaskInfo.status == InProcess {
+
+				pendingTaskExist = true
+				timeNow := time.Now()
+				timeElapsedInSecs := timeNow.Sub(reduceTaskInfo.taskAssignedTime)
+
+				if timeElapsedInSecs.Seconds() > float64(10) {
+
+					fmt.Println("Reduce task for file", taskFileName, "is not completed in threshold time, reassigning it")
+					c.reduceTaskStatus[taskFileName] = ReduceTaskInfo{status: NotProcessed, assignedWorker: "", taskAssignedTime: time.Time{}, partitionFileList: reduceTaskInfo.partitionFileList}
+
+				}
+			} else if reduceTaskInfo.status == NotProcessed {
+				pendingTaskExist = true
+			}
+		}
+
+		reduceTaskLock.Unlock()
+
+		if pendingTaskExist == true {
+			fmt.Println("Pending task exists. Will sleep for 3 secs")
+			time.Sleep(3 * time.Second)
+		}
+
+	}
+
+}
+
 // func (c *Coordinator) GetTask(
 // start a thread that listens for RPCs from worker.go
 func (c *Coordinator) server() {
@@ -175,6 +286,8 @@ func (c *Coordinator) server() {
 		log.Fatal("listen error:", e)
 	}
 	go http.Serve(l, nil)
+
+	go c.TaskCompletionChecker()
 }
 
 // create a Coordinator.
@@ -184,13 +297,13 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 
 	c := Coordinator{}
 
-	c.mapTaskStatus = make(map[string]TaskInfo)
+	c.mapTaskStatus = make(map[string]MapTaskInfo)
 	for _, fileName := range files {
-		c.mapTaskStatus[fileName] = TaskInfo{status: NotProcessed, assignedWorker: ""}
+		c.mapTaskStatus[fileName] = MapTaskInfo{status: NotProcessed, assignedWorker: ""}
 	}
 
 	c.partitionsCount = nReduce
-	c.reduceTaskStatus = make(map[string]TaskInfo) //this will be filled as and when map tasks are completed
+	c.reduceTaskStatus = make(map[string]ReduceTaskInfo) //this will be filled as and when map tasks are completed
 
 	c.server() //calls a goroutine to listen to RPC calls from worker
 

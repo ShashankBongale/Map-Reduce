@@ -10,7 +10,6 @@ import (
 	"os"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 )
 
@@ -37,6 +36,7 @@ func ihash(key string) int {
 }
 
 var processId int = os.Getpid()
+var allMapOutputFiles map[string]struct{} = make(map[string]struct{}) //this works like a set now
 
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
@@ -44,11 +44,11 @@ func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string)
 	GetTaskFromCoordinator(mapf, reducef)
 }
 
-func RunMapTask(fileName string, partitionCount int, mapf func(string, string) []KeyValue) []int {
+func RunMapTask(fileName string, partitionCount int, mapf func(string, string) []KeyValue) []string {
 
 	fmt.Println("Got Map task with file", fileName)
 
-	var partitionList []int
+	var partitionList []string
 
 	file, err := os.Open(fileName)
 	if err != nil {
@@ -91,7 +91,8 @@ func RunMapTask(fileName string, partitionCount int, mapf func(string, string) [
 			err = jsonEncoder.Encode(&kvpair)
 		}
 
-		partitionList = append(partitionList, partition)
+		partitionList = append(partitionList, partitionFileName)
+		allMapOutputFiles[partitionFileName] = struct{}{}
 
 		fileHandler.Close()
 	}
@@ -101,60 +102,45 @@ func RunMapTask(fileName string, partitionCount int, mapf func(string, string) [
 	return partitionList
 }
 
-func RunReduceTask(partitionName string, reducef func(string, []string) string) {
+func RunReduceTask(partitionName string, partitionList []string, reducef func(string, []string) string) {
 
 	fmt.Println("Got reduce task with partition", partitionName)
 
-	folderHandler, err := os.Open(".")
-	if err != nil {
-		fmt.Println("Failed to read partition file. Exiting reduce task")
-		return
-	}
-
-	defer folderHandler.Close()
-
-	fileList, err := folderHandler.Readdirnames(0)
-	if err != nil {
-		fmt.Println("Failed to read partition file. Exiting reduce task")
-		return
-	}
-
-	reqFileSubString := "." + partitionName + ".mapoutput"
 	var keyValueList []KeyValue
 
-	for _, fileName := range fileList {
+	for _, fileName := range partitionList {
 
-		if strings.Contains(fileName, reqFileSubString) {
+		//fmt.Println("Processing file", fileName)
 
-			//fmt.Println("Processing file", fileName)
+		fileHander, err := os.Open(fileName)
 
-			fileHander, err := os.Open(fileName)
-
-			if err != nil {
-				fmt.Println("Failed to open partition file", fileName)
-				continue
-			}
-
-			jsonDecoder := json.NewDecoder(fileHander)
-
-			for {
-				var keyValue KeyValue
-				if err := jsonDecoder.Decode(&keyValue); err != nil {
-					break
-				}
-				keyValueList = append(keyValueList, keyValue)
-			}
-
-			fileHander.Close()
-			os.Remove(fileName)
+		if err != nil {
+			fmt.Println("Failed to open partition file", fileName)
+			continue
 		}
+
+		jsonDecoder := json.NewDecoder(fileHander)
+
+		for {
+			var keyValue KeyValue
+			if err := jsonDecoder.Decode(&keyValue); err != nil {
+				break
+			}
+			keyValueList = append(keyValueList, keyValue)
+		}
+
+		fileHander.Close()
+		//os.Remove(fileName)
+
 	}
 
 	//sort the keyValue based on keys and pass the keyvalue to reduce for each unique reduce
 	sort.Sort(ByKey(keyValueList))
-	outputFileName := "mr-out-" + partitionName
 
-	fileHandler, err := os.Create(outputFileName)
+	outputFileName := "mr-out-" + partitionName
+	tempOutputFileName := outputFileName + ".temp"
+
+	fileHandler, err := os.Create(tempOutputFileName)
 	if err != nil {
 		fmt.Println("Failed to create reduce output file", outputFileName)
 		return
@@ -185,6 +171,12 @@ func RunReduceTask(partitionName string, reducef func(string, []string) string) 
 
 	fileHandler.Close()
 
+	err = os.Rename(tempOutputFileName, outputFileName)
+
+	if err != nil {
+		fmt.Println("Failed to rename file", tempOutputFileName, "to", outputFileName)
+	}
+
 	fmt.Println("Done with reduce task for partition", partitionName)
 }
 
@@ -204,7 +196,7 @@ func GetTaskFromCoordinator(mapf func(string, string) []KeyValue, reducef func(s
 		if ok {
 			if task.TaskType == NoTask {
 
-				fmt.Println("No task from coordinator, will retry in a second")
+				//fmt.Println("No task from coordinator, will retry in a second")
 
 				time.Sleep(1 * time.Second)
 
@@ -227,7 +219,7 @@ func GetTaskFromCoordinator(mapf func(string, string) []KeyValue, reducef func(s
 
 			} else if task.TaskType == ReduceTask {
 
-				RunReduceTask(task.FileName, reducef)
+				RunReduceTask(task.FileName, task.Partitions, reducef)
 
 				timeNow = time.Now()
 				lastTaskReceivedTime = time.Now()
@@ -240,7 +232,13 @@ func GetTaskFromCoordinator(mapf func(string, string) []KeyValue, reducef func(s
 				}
 
 			} else {
-				fmt.Println("Exiting worker")
+
+				fmt.Println("Got exit task, cleaning all intermediate map files")
+				for fileName, _ := range allMapOutputFiles {
+					if err := os.Remove(fileName); err != nil {
+						fmt.Println("Failed to delete file", fileName)
+					}
+				}
 				return
 			}
 
