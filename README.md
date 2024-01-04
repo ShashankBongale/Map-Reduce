@@ -22,3 +22,4 @@ This repository has Go implementation of Map-Reduce research paper published by 
 * Command to run worker process  
     go run mrworker.go wc.so  
 
+
